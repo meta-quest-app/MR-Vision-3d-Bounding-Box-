@@ -17,9 +17,21 @@ EditorBuildSettings:
   - enabled: 0
     path: Assets/Phase4_pixelSelector.unity
     guid: 2c158dc57ba169f4d83beab09a003eed
-  - enabled: 1
+  - enabled: 0
     path: Assets/Phase5_PrecisePoints.unity
     guid: 05d89de573b49c14a8e190c404547306
+  - enabled: 0
+    path: Assets/Phase6_FinalDebugger.unity
+    guid: 2970e5f456f25cb419d58704ef84f6ed
+  - enabled: 0
+    path: Assets/Phase7_BB.unity
+    guid: 3f008f242ea0efb48ac6cca94724369e
+  - enabled: 0
+    path: Assets/Phase8_CannyEdge.unity
+    guid: 587c9a553cb85bb4495e0e1e282cabf2
+  - enabled: 1
+    path: Assets/Phase9_OverlayBox.unity
+    guid: e2e0622bb8ee4a54d96e1da9c37a5c04
   m_configObjects:
     com.unity.dt.app-ui: {fileID: 11400000, guid: 1b1c20d82303e4b5781c3ef50ac1449f, type: 2}
     com.unity.input.settings.actions: {fileID: -944628639613478452, guid: 052faaac586de48259a63d0c4782560b, type: 3}

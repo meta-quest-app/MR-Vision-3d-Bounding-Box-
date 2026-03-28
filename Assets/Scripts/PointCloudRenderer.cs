@@ -4,8 +4,8 @@ using Meta.XR.BuildingBlocks.AIBlocks;
 
 /// <summary>
 /// Renders a point cloud for ONLY the segmented object pixels.
-/// Phase 5: Computes 3D world positions on the CPU using inverse VP ray-casting.
-/// No longer relies on _EnvironmentDepthZBufferParams (which was likely unset).
+/// Phase 6: Perfects the 3D projection math using explicit Near/Far plane raycasting,
+/// eliminating the flat plane clipping issues and the reliance on extracting the camera origin.
 /// </summary>
 [RequireComponent(typeof(MeshFilter), typeof(MeshRenderer))]
 public class PointCloudRenderer : MonoBehaviour
@@ -47,43 +47,30 @@ public class PointCloudRenderer : MonoBehaviour
 
         _meshRenderer.enabled = false;
 
-        // CRITICAL: Keep transform at identity so vertex positions = world positions
+        // CRITICAL PHASE 6: Detach from ALL parents (especially Canvas) so its
+        // World Position and Scale are 100% untainted by UI RectTransforms!
+        transform.SetParent(null, true);
         transform.position = Vector3.zero;
         transform.rotation = Quaternion.identity;
         transform.localScale = Vector3.one;
     }
 
-    /// <summary>
-    /// Extracts the camera (eye) position from a ViewProjection matrix.
-    /// Camera position is the null-point of the VP matrix: VP * [c,1]^T has w=0.
-    /// Computed as: c = -(VP_3x3)^-1 * VP_col3
-    /// </summary>
-    private Vector3 ExtractCameraPosition(Matrix4x4 vp)
+    private Vector3 UnprojectPixel(int px, int py, int texSize, float ndcZ, Matrix4x4 invVP)
     {
-        // Build the upper-left 3x3 submatrix
-        Matrix4x4 m = Matrix4x4.identity;
-        m[0, 0] = vp[0, 0]; m[0, 1] = vp[0, 1]; m[0, 2] = vp[0, 2];
-        m[1, 0] = vp[1, 0]; m[1, 1] = vp[1, 1]; m[1, 2] = vp[1, 2];
-        m[2, 0] = vp[2, 0]; m[2, 1] = vp[2, 1]; m[2, 2] = vp[2, 2];
-
-        Matrix4x4 inv = m.inverse;
-
-        // The 4th column (translation part) of the VP matrix
-        Vector3 t = new Vector3(vp[0, 3], vp[1, 3], vp[2, 3]);
-
-        // Camera position = -inv(VP_3x3) * VP_col3
-        Vector3 camPos;
-        camPos.x = -(inv[0, 0] * t.x + inv[0, 1] * t.y + inv[0, 2] * t.z);
-        camPos.y = -(inv[1, 0] * t.x + inv[1, 1] * t.y + inv[1, 2] * t.z);
-        camPos.z = -(inv[2, 0] * t.x + inv[2, 1] * t.y + inv[2, 2] * t.z);
-
-        return camPos;
+        float u = (px + 0.5f) / texSize;
+        float v = (py + 0.5f) / texSize;
+        float ndcX = u * 2f - 1f;
+        float ndcY = -(v * 2f - 1f); // Depth map textures usually have top-left origin, NDC is bottom-left
+        
+        Vector4 clipPt = new Vector4(ndcX, ndcY, ndcZ, 1f);
+        Vector4 worldPt4 = invVP * clipPt;
+        
+        // Perspective divide
+        return new Vector3(worldPt4.x / worldPt4.w, worldPt4.y / worldPt4.w, worldPt4.z / worldPt4.w);
     }
 
     /// <summary>
-    /// Called by ObjectSelector after segmentation is complete.
-    /// Computes world positions on CPU using inverse VP ray-casting,
-    /// then builds a mesh with billboarded quads at those world positions.
+    /// Computes accurate 3D positions by unprojecting rays natively on CPU.
     /// </summary>
     public void RenderSegmentedPoints(int[] segmentedIndices, float[] depthPixels, int textureSize, Matrix4x4[] viewProjMatrices)
     {
@@ -96,20 +83,21 @@ public class PointCloudRenderer : MonoBehaviour
         Matrix4x4 vp = viewProjMatrices[0]; // Left eye
         Matrix4x4 invVP = vp.inverse;
 
-        // Extract depth camera position from the VP matrix
-        Vector3 camPos = ExtractCameraPosition(vp);
-
-        // Compute the camera forward direction by unprojecting the center pixel
-        Vector4 centerClip = new Vector4(0f, 0f, 0.5f, 1f);
-        Vector4 centerW4 = invVP * centerClip;
-        Vector3 centerWorld = new Vector3(centerW4.x / centerW4.w, centerW4.y / centerW4.w, centerW4.z / centerW4.w);
-        Vector3 camForward = (centerWorld - camPos).normalized;
-
-        // Get the camera's right and up vectors for billboard orientation
-        // Use the main camera for billboard facing (it represents where the user is looking)
+        // Use the main tracking camera as a highly reliable reference for the optical origin
+        // (The left eye depth camera is nearly identical in position to the main tracked head)
         Camera mainCam = Camera.main;
-        Vector3 billboardRight = mainCam != null ? mainCam.transform.right : Vector3.right;
-        Vector3 billboardUp = mainCam != null ? mainCam.transform.up : Vector3.up;
+        if (mainCam == null) return;
+        
+        Vector3 camPos = mainCam.transform.position;
+
+        // Calculate the depth camera's forward vector by unprojecting the dead center pixel
+        Vector3 centerNear = UnprojectPixel(textureSize / 2, textureSize / 2, textureSize, 1.0f, invVP);
+        Vector3 centerFar = UnprojectPixel(textureSize / 2, textureSize / 2, textureSize, 0.0f, invVP);
+        Vector3 camForward = (centerFar - centerNear).normalized;
+
+        // Billboard orientation
+        Vector3 billboardRight = mainCam.transform.right;
+        Vector3 billboardUp = mainCam.transform.up;
 
         int numQuads = segmentedIndices.Length;
         int numVerts = numQuads * 4;
@@ -138,27 +126,21 @@ public class PointCloudRenderer : MonoBehaviour
             if (depth <= 0.1f || depth > 10.0f)
                 continue;
 
-            // ── Pixel → NDC ──
-            float u = (px + 0.5f) / textureSize;
-            float v = (py + 0.5f) / textureSize;
-            float ndcX = u * 2f - 1f;
-            float ndcY = -(v * 2f - 1f); // Flip Y: depth texture top-left origin → NDC bottom-left origin
+            // Phase 6 Math Fix: Near/Far Unprojection
+            // Unproject both the near clip plane (1.0) and far clip plane (0.0) for this pixel
+            // (Note: Unity/Meta usually uses Reversed-Z, so 1.0 is near, 0.0 is far)
+            Vector3 nearPt = UnprojectPixel(px, py, textureSize, 1.0f, invVP);
+            Vector3 farPt = UnprojectPixel(px, py, textureSize, 0.0f, invVP);
+            
+            // Ray direction connecting near and far planes
+            Vector3 rayDir = (farPt - nearPt).normalized;
 
-            // ── Unproject to get the ray direction ──
-            // Use any ndcZ (0.5) to get a world-space point on the ray through this pixel
-            Vector4 clipPt = new Vector4(ndcX, ndcY, 0.5f, 1f);
-            Vector4 worldPt4 = invVP * clipPt;
-            Vector3 worldPt = new Vector3(worldPt4.x / worldPt4.w, worldPt4.y / worldPt4.w, worldPt4.z / worldPt4.w);
-
-            // Ray from depth camera through this pixel
-            Vector3 rayDir = (worldPt - camPos).normalized;
-
-            // ── Place point at correct depth along the ray ──
-            // Linear depth = distance along camera's forward axis (not along the ray).
-            // So rayDistance = linearDepth / cos(angle between ray and forward)
+            // Depth provided by the API is typically Linear Depth (Z-axis distance, not ray distance).
+            // To find the along-ray distance: distance = linearDepth / cos(angle to principal axis)
             float cosAngle = Vector3.Dot(rayDir, camForward);
             float rayDist = (Mathf.Abs(cosAngle) > 0.001f) ? depth / cosAngle : depth;
 
+            // Place the point physically in the world
             Vector3 worldPos = camPos + rayDir * rayDist;
 
             // ── Build a camera-facing billboard quad ──
@@ -179,7 +161,7 @@ public class PointCloudRenderer : MonoBehaviour
             validCount++;
         }
 
-        // Trim arrays if some points were skipped
+        // Trim arrays
         if (vIdx < numVerts)
         {
             System.Array.Resize(ref verts, vIdx);
@@ -194,11 +176,8 @@ public class PointCloudRenderer : MonoBehaviour
         _meshRenderer.enabled = true;
         _lastMeshVertCount = vIdx;
 
-        // Store debug detail for UI
-        Vector4 zParamsCheck = Shader.GetGlobalVector("_EnvironmentDepthZBufferParams");
-        _lastDebugDetail = $"CamPos: ({camPos.x:F2},{camPos.y:F2},{camPos.z:F2}) | Valid: {validCount}\nZParams: ({zParamsCheck.x:F2},{zParamsCheck.y:F2},{zParamsCheck.z:F2},{zParamsCheck.w:F2})";
-
-        Debug.Log($"[PointCloudRenderer] Phase 5: {validCount} world-positioned points, camPos={camPos}");
+        _lastDebugDetail = $"Phase 6 Unproj | Valid: {validCount}\nCam: ({camPos.x:F2}, {camPos.y:F2}, {camPos.z:F2})";
+        Debug.Log($"[PointCloudRenderer] Phase 6: {validCount} points.");
     }
 
     public void ClearPointCloud()
